@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <!--
+        Improves performance of java.util.logging.Logger calls
+        See https://logback.qos.ch/manual/configuration.html#LevelChangePropagator
+    -->
+    <contextListener class="ch.qos.logback.classic.jul.LevelChangePropagator">
+        <resetJUL>true</resetJUL>
+    </contextListener>
+
+    <variable name="logLevel" value="INFO"/>
+    <appender name="stdout" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%p %d{ISO8601} %r %c [%t] %m%n</pattern>
+        </encoder>
+    </appender>
+    <!--default level is INFO, can be overridden (in DEV and TEST environments) by setting -DlogLevel=DEBUG-->
+    <root level="${logLevel}">
+        <appender-ref ref="stdout"/>
+    </root>
+
+    <!--MessageDispatcher TRACE: acks, modacks-->
+    <logger name="com.google.cloud.pubsub.v1.MessageDispatcher" level="TRACE"/>
+    <logger name="com.google.cloud.pubsub.v1.StreamingSubscriberConnection" level="TRACE"/>
+</configuration>

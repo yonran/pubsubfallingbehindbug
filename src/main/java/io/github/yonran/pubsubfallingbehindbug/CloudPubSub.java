@@ -4,12 +4,14 @@ import com.google.api.gax.batching.FlowControlSettings;
 import com.google.cloud.ServiceOptions;
 import com.google.cloud.pubsub.v1.Subscriber;
 import com.google.pubsub.v1.ProjectSubscriptionName;
+import com.google.pubsub.v1.ProjectTopicName;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import picocli.CommandLine;
 
 import java.io.File;
 import java.io.FileNotFoundException;
+import java.io.IOException;
 
 @CommandLine.Command(name = "cloud", mixinStandardHelpOptions = true, version = "v0.0.0", showDefaultValues = true)
 public class CloudPubSub implements Runnable {
@@ -18,6 +20,21 @@ public class CloudPubSub implements Runnable {
 	@CommandLine.Option(names = {"--project"})
 	private String project;
 
+	// For Publisher
+	@CommandLine.Option(names = {"--topic"}, required = false,
+			description = "(Publisher) Topic to publish to. If non-null, then we will create a publisher.")
+	private String topic;
+
+	@CommandLine.Option(names = {"--initial-publish-messages"}, required = false,
+			description = "(Publisher) Number of messages to publish when the publisher is created.")
+	private int initialPublishMessgages = 0;
+
+	@CommandLine.Option(names = {"--publish-period"}, required = false,
+			description = "(Publisher) Number of messages to publish when the publisher is created.")
+	private long sleepBetweenPublish = (long)(1000/2.5);
+
+
+	// For Subscription
 	@CommandLine.Option(names = {"--subscription"}, required = true)
 	private String subscription;
 
@@ -25,16 +42,16 @@ public class CloudPubSub implements Runnable {
 	private File logTo;
 
 	@CommandLine.Option(names = {"--concurrent-messages"}, required = false,
-			description = "Number of concurrent receiveMessage calls.")
+			description = "(Subscriber) Number of concurrent receiveMessage calls.")
 	private long concurrentReceiveCount = 20;
 
 	@CommandLine.Option(names = {"--message-processing-time"}, required = false,
-			description = "Amount of time that each message takes. This should not affect the receiver throughput " +
+			description = "(Subscriber) Amount of time that each message takes. This should not affect the receiver throughput " +
 					"as long as message-processing-time < processor rate * concurrent-messages")
 	private long perMessageSleepMs = 5000;
 
 	@CommandLine.Option(names = {"--period"}, required = false,
-			description = "Amount of time between messages that complete processing among all receivers." +
+			description = "(Subscriber) Amount of time between messages that complete processing among all receivers." +
 					"This allows you to tune the receiver rate.")
 	private long minTimeBetweenMessagesMs = 1000/3;
 
@@ -48,6 +65,20 @@ public class CloudPubSub implements Runnable {
 			}
 		}
 		ProjectSubscriptionName subscriptionName = ProjectSubscriptionName.of(project, subscription);
+		if (topic != null) {
+			MyProducer producer = null;
+			try {
+				producer = new MyProducer(ProjectTopicName.of(project, topic),
+						initialPublishMessgages,
+						sleepBetweenPublish);
+			} catch (IOException e) {
+				logger.error("Could not create pubsub producer", e);
+				System.exit(1);
+			}
+			Thread thread = new Thread(producer, "Producer thread");
+			thread.setDaemon(true);
+			thread.start();
+		}
 
 		try {
 			LogMessagesReceiver pubSubReceiver = pubSubReceiver = new LogMessagesReceiver(

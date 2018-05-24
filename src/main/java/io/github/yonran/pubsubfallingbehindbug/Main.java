@@ -5,7 +5,7 @@ import picocli.CommandLine;
 import picocli.CommandLine.Command;
 
 @Command(name = "PubSubber", mixinStandardHelpOptions = true, version = "v0.0.0",
-        subcommands = {CloudPubSub.class})
+        subcommands = {CloudPubSub.class, RawPubSub.class})
 public class Main implements Runnable {
 	@Override
 	public void run() {

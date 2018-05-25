@@ -4,14 +4,13 @@ the same duplicate messages over and over.
 To demonstrate the bug:
 
 ```sh
+mvn clean package
+
+# Start Receiver which processes at 3 messages/second
+# When --topic is specified, a publisher is also created which publishes a backlog
+# and then a steady stream of messages
 gcloud pubsub topics create pubsubfallingbehind-top
 gcloud pubsub subscriptions create --topic pubsubfallingbehind-top pubsubfallingbehind-sub
-
-# Not shown: Publisher which publishes at 2.5 messages/second
-# Then wait a few hours before starting the receiver to create a backlog
-
-mvn clean package
-# Start Receiver which processes at 3 messages/second
 java -cp "target/lib/*:target/classes" io.github.yonran.pubsubfallingbehindbug.Main cloud \
     --topic pubsubfallingbehind-top --initial-publish-messages 10000 --publish-period 400 \
     --subscription pubsubfallingbehind-sub --period 333 --log-to=/tmp/inv-log-cloudpubsub-pub2.5-sub3.jsons
@@ -30,7 +29,10 @@ Messages are repeated about every hour.
 I also added a test using StreamingPull that does similar API calls to the high-level API.
 It uses a single connection at a time and reconnects on StatusRuntimeException (which is apparently every half hour).
 
+It also gets many duplicates after a while, so apparently the bug is server-side.
+
 ```sh
+mvn clean package
 gcloud pubsub topics create pubsubfallingbehind-grpc-top
 gcloud pubsub subscriptions create --topic pubsubfallingbehind-grpc-top pubsubfallingbehind-grpc-sub
 java -cp "target/lib/*:target/classes" io.github.yonran.pubsubfallingbehindbug.Main grpc \
@@ -40,3 +42,9 @@ java -cp "target/lib/*:target/classes" io.github.yonran.pubsubfallingbehindbug.M
 gcloud pubsub subscriptions delete pubsubfallingbehind-grpc-sub
 gcloud pubsub topics delete pubsubfallingbehind-grpc-top
 ```
+
+
+## Pubsub v0.21.1-beta test
+
+In GoogleCloudPlatform/google-cloud-java#2465, a comment recommends using google-cloud-pubsub v0.21.1.
+The branch pubsub-0.21.1-beta uses this version to test.

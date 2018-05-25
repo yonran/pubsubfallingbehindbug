@@ -54,7 +54,8 @@ public class LogMessagesReceiver implements MessageReceiver {
 		PubsubMessageMetadata jsonMsg = new PubsubMessageMetadata(
 				message.getMessageId(),
 				publishTimeInstant.toString(),
-				now.toString()
+				now.toString(),
+				null
 		);
 		try {
 			// Extra delay that should not affect throughput

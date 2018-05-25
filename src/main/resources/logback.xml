@@ -22,5 +22,4 @@
     <!--MessageDispatcher TRACE: acks, modacks-->
     <logger name="com.google.cloud.pubsub.v1.MessageDispatcher" level="INFO"/>
     <logger name="com.google.cloud.pubsub.v1.StreamingSubscriberConnection" level="TRACE"/>
-    <logger name="io.github.yonran.pubsubfallingbehindbug.RawPubSub" level="DEBUG"/>
 </configuration>

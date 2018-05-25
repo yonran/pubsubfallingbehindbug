@@ -3,8 +3,8 @@ package io.github.yonran.pubsubfallingbehindbug;
 import com.google.api.core.ApiFuture;
 import com.google.cloud.pubsub.v1.Publisher;
 import com.google.common.util.concurrent.MoreExecutors;
-import com.google.pubsub.v1.ProjectTopicName;
 import com.google.pubsub.v1.PubsubMessage;
+import com.google.pubsub.v1.TopicName;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -14,16 +14,16 @@ import java.util.concurrent.ExecutionException;
 
 public class MyProducer implements Runnable {
 	private static final Logger logger = LoggerFactory.getLogger(MyProducer.class);
-	private final ProjectTopicName topic;
+	private final TopicName topic;
 	private final int initialMessageCount;
 	private final long sleepBetweenPublish;
 	private final Publisher publisher;
 
-	public MyProducer(ProjectTopicName topic, int initialMessageCount, long sleepBetweenPublish) throws IOException {
+	public MyProducer(TopicName topic, int initialMessageCount, long sleepBetweenPublish) throws IOException {
 		this.topic = topic;
 		this.initialMessageCount = initialMessageCount;
 		this.sleepBetweenPublish = sleepBetweenPublish;
-		this.publisher = Publisher.newBuilder(this.topic).build();
+		this.publisher = Publisher.defaultBuilder(this.topic).build();
 	}
 
 	@Override

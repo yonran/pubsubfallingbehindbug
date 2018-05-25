@@ -3,8 +3,8 @@ package io.github.yonran.pubsubfallingbehindbug;
 import com.google.api.gax.batching.FlowControlSettings;
 import com.google.cloud.ServiceOptions;
 import com.google.cloud.pubsub.v1.Subscriber;
-import com.google.pubsub.v1.ProjectSubscriptionName;
-import com.google.pubsub.v1.ProjectTopicName;
+import com.google.pubsub.v1.SubscriptionName;
+import com.google.pubsub.v1.TopicName;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import picocli.CommandLine;
@@ -64,11 +64,11 @@ public class CloudPubSub implements Runnable {
 				System.err.println("You must specify --project or set up application-default project");
 			}
 		}
-		ProjectSubscriptionName subscriptionName = ProjectSubscriptionName.of(project, subscription);
+		SubscriptionName subscriptionName = SubscriptionName.create(project, subscription);
 		if (topic != null) {
 			MyProducer producer = null;
 			try {
-				producer = new MyProducer(ProjectTopicName.of(project, topic),
+				producer = new MyProducer(TopicName.create(project, topic),
 						initialPublishMessgages,
 						sleepBetweenPublish);
 			} catch (IOException e) {
@@ -86,7 +86,7 @@ public class CloudPubSub implements Runnable {
 					perMessageSleepMs,
 					minTimeBetweenMessagesMs
 					);
-			Subscriber subscriber = Subscriber.newBuilder(subscriptionName, pubSubReceiver)
+			Subscriber subscriber = Subscriber.defaultBuilder(subscriptionName, pubSubReceiver)
 				.setFlowControlSettings(FlowControlSettings.newBuilder()
 					// at most 10 concurrent requests should be out
 					.setMaxOutstandingElementCount(concurrentReceiveCount)

@@ -29,6 +29,7 @@ import com.google.pubsub.v1.SubscriberGrpc;
 import io.github.yonran.pubsubfallingbehindbug.schema.PubsubMessageMetadata;
 import io.grpc.CallCredentials;
 import io.grpc.Channel;
+import io.grpc.StatusRuntimeException;
 import io.grpc.auth.MoreCallCredentials;
 import io.grpc.stub.ClientCallStreamObserver;
 import io.grpc.stub.ClientResponseObserver;
@@ -44,7 +45,6 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedList;
 import java.util.List;
@@ -53,6 +53,7 @@ import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @CommandLine.Command(name = "grpc", mixinStandardHelpOptions = true, version = "v0.0.0")
 public class RawPubSub implements Runnable {
@@ -142,27 +143,28 @@ public class RawPubSub implements Runnable {
 
 
 		// Based on Subscriber.java:
-		TransportChannelProvider channelProvider = SubscriptionAdminSettings.defaultGrpcTransportProviderBuilder()
+		TransportChannelProvider channelProviderTmp = SubscriptionAdminSettings.defaultGrpcTransportProviderBuilder()
 				.setMaxInboundMessageSize(MAX_INBOUND_MESSAGE_SIZE)
 				.setKeepAliveTime(Duration.ofMinutes(5))
 				.build();
-		if (channelProvider.needsExecutor()) {
+		if (channelProviderTmp.needsExecutor()) {
 			executor = DEFAULT_EXECUTOR_PROVIDER.getExecutor();
-			channelProvider = channelProvider.withExecutor(executor);
+			channelProviderTmp = channelProviderTmp.withExecutor(executor);
 		}
 		HeaderProvider headerProvider = new NoHeaderProvider();
 		HeaderProvider internalHeaderProvider = new NoHeaderProvider();
-		if (channelProvider.needsHeaders()) {
+		if (channelProviderTmp.needsHeaders()) {
 			Map<String, String> headers =
 					ImmutableMap.<String, String>builder()
 							.putAll(headerProvider.getHeaders())
 							.putAll(internalHeaderProvider.getHeaders())
 							.build();
-			channelProvider = channelProvider.withHeaders(headers);
+			channelProviderTmp = channelProviderTmp.withHeaders(headers);
 		}
-		if (channelProvider.needsEndpoint()) {
-			channelProvider = channelProvider.withEndpoint(SubscriptionAdminSettings.getDefaultEndpoint());
+		if (channelProviderTmp.needsEndpoint()) {
+			channelProviderTmp = channelProviderTmp.withEndpoint(SubscriptionAdminSettings.getDefaultEndpoint());
 		}
+		final TransportChannelProvider channelProvider = channelProviderTmp;
 		GoogleCredentialsProvider credentialsProvider = SubscriptionAdminSettings.defaultCredentialsProviderBuilder().build();
 		Credentials credentials;
 		try {
@@ -172,239 +174,300 @@ public class RawPubSub implements Runnable {
 			return;
 		}
 		CallCredentials callCredentials = credentials == null ? null : MoreCallCredentials.from(credentials);
-		GrpcTransportChannel transportChannel;
-		Channel channel;
-		try {
-			// Create only a single Channel
-			transportChannel = (GrpcTransportChannel) channelProvider.getTransportChannel();
-			channel = transportChannel.getChannel();
-		} catch (IOException e) {
-			logger.error("Failure creating channel", e);
-			return;
-		}
-		// Synchronized on itself
-		LinkedList<MessageAndTime> pendingMessages = new LinkedList<>();
-		SettableFuture<Void> complete = SettableFuture.create();
-		try {
-			// google-cloud-pubsub/src/main/java/com/google/cloud/pubsub/v1/StreamingSubscriberConnection.java
-			SubscriberGrpc.SubscriberStub stubTmp = SubscriberGrpc.newStub(channel);
-			if (callCredentials != null) stubTmp = stubTmp.withCallCredentials(callCredentials);
-			final SubscriberGrpc.SubscriberStub stub = stubTmp;
-			// based on com.google.cloud.pubsub.v1.StreamingSubscriberConnection.StreamingPullResponseObserver
-			StreamObserver<StreamingPullResponse> responseObserver = new ClientResponseObserver<StreamingPullRequest, StreamingPullResponse>() {
-				@Override
-				public void beforeStart(ClientCallStreamObserver<StreamingPullRequest> requestObserver) {
-					logger.trace("ResponseObserver disabling flow control");
-					requestObserver.disableAutoInboundFlowControl();
-				}
 
-				@Override
-				public void onNext(StreamingPullResponse response) {
-					List<ReceivedMessage> receivedMessages = response.getReceivedMessagesList();
-					long now = System.currentTimeMillis();
-					List<String> messageIds = new ArrayList<>();
-					for (ReceivedMessage receivedMessage: receivedMessages) {
-						messageIds.add(receivedMessage.getMessage().getMessageId());
+		SettableFuture<Void> receiverGaveUp = SettableFuture.create();
+		Thread receiverThread = new Thread(new Runnable() {
+			ObjectMapper mapper = new ObjectMapper();
+			private ClientResponseObserver<StreamingPullRequest, StreamingPullResponse> createResponseObserver(LinkedList<MessageAndTime> pendingMessages, AtomicBoolean outstandingRequestCalled, SettableFuture<Void> connectionComplete) {
+				// based on com.google.cloud.pubsub.v1.StreamingSubscriberConnection.StreamingPullResponseObserver
+				return new ClientResponseObserver<StreamingPullRequest, StreamingPullResponse>() {
+					@Override
+					public void beforeStart(ClientCallStreamObserver<StreamingPullRequest> requestObserver) {
+						logger.trace("ResponseObserver disabling flow control");
+						requestObserver.disableAutoInboundFlowControl();
 					}
-					logger.info("Received " + receivedMessages.size() + " messages: " + messageIds);
-					synchronized (pendingMessages) {
+
+					@Override
+					public void onNext(StreamingPullResponse response) {
+						List<ReceivedMessage> receivedMessages = response.getReceivedMessagesList();
+						long now = System.currentTimeMillis();
+						List<String> messageIds = new ArrayList<>();
 						for (ReceivedMessage receivedMessage: receivedMessages) {
-							pendingMessages.add(new MessageAndTime(
-									receivedMessage,
-									now + perMessageSleepMs,
-									now + INITIAL_ASSUMED_DEADLINE - DEADLINE_EXTEND_PADDING
-							));
+							messageIds.add(receivedMessage.getMessage().getMessageId());
 						}
-						pendingMessages.notifyAll();
+						logger.info("Received " + receivedMessages.size() + " messages: " + messageIds);
+						synchronized (pendingMessages) {
+							outstandingRequestCalled.set(false);
+							for (ReceivedMessage receivedMessage: receivedMessages) {
+								pendingMessages.add(new MessageAndTime(
+										receivedMessage,
+										now + perMessageSleepMs,
+										now + INITIAL_ASSUMED_DEADLINE - DEADLINE_EXTEND_PADDING
+								));
+							}
+							pendingMessages.notifyAll();
+						}
 					}
-				}
 
-				@Override
-				public void onError(Throwable t) {
-					complete.setException(t);
-				}
-
-				@Override
-				public void onCompleted() {
-					complete.set(null);
-				}
-			};
-			ClientCallStreamObserver<StreamingPullRequest> requestObserver =
-					(ClientCallStreamObserver<StreamingPullRequest>)
-							stub.streamingPull(responseObserver);
-			// We need to set streaming ack deadline, but it's not useful since we'll modack to send receipt anyway.
-			// Set to some big-ish value in case we modack late.
-			requestObserver.onNext(
-					StreamingPullRequest.newBuilder()
-							.setSubscription(subscriptionName.toString())
-							.setStreamAckDeadlineSeconds(60)
-							.build());
-			requestObserver.request(1);
-
-			Thread receiverThread = new Thread(new Runnable() {
-				@Override
-				public void run() {
-					logger.debug("Receiver thread starting");
-					try {
-						ObjectMapper mapper = new ObjectMapper();
-						OutputStream outputStream;
-						if (logTo != null) {
-							outputStream = new FileOutputStream(logTo);
-						} else {
-							outputStream = ByteStreams.nullOutputStream();
+					@Override
+					public void onError(Throwable t) {
+						connectionComplete.setException(t);
+						synchronized (pendingMessages) {
+							pendingMessages.notifyAll();
 						}
-						JsonGenerator generator;
-						try {
-							generator = mapper.getFactory()
-									.setRootValueSeparator("\n")
-									.createGenerator(outputStream);
-						} catch (IOException e) {
-							throw new RuntimeException(e);  // should not happen
-						}
-
-						SubscriberGrpc.SubscriberStub timeoutStub =
-								stub.withDeadlineAfter(60, TimeUnit.SECONDS);
-
-						long nextAckTime = 0;  // Minimum ack time based on simulated processing time
-						while (true) {
-							long now = System.currentTimeMillis();
-							long newDeadline = now + DEADLINE_EXTEND_AMOUNT;
-							long newDeadlineExtendTime = newDeadline - DEADLINE_EXTEND_PADDING;
-							int deadlineDurationSeconds = (int) ((newDeadline - now) / 1000);
-							ReceivedMessage messageToAck = null;
-							ArrayList<ReceivedMessage> messagesToExtend = new ArrayList<>();
-
-							synchronized (pendingMessages) {
-								if (pendingMessages.size() < 1) {
-									int count = 1;
-									logger.trace("Receiver requesting " + count + " message");
-									requestObserver.request(count);
-								}
-								if (pendingMessages.isEmpty()) {
-									logger.trace("Receiver thread queue empty; waiting");
-									pendingMessages.wait();
-									continue;
-								} else {
-									long nextExtendTime = Long.MAX_VALUE;
-									for (MessageAndTime messageAndTime: pendingMessages) {
-										nextExtendTime = Math.min(nextExtendTime, messageAndTime.deadlineExtendTime);
-									}
-									MessageAndTime nextMessage = pendingMessages.getFirst();
-									long nextMessageAckTime = Math.max(
-											nextAckTime,
-											nextMessage.minAckTime);
-									long waitTime = Math.min(nextMessageAckTime, nextExtendTime) - now;
-									if (waitTime > 0) {
-										logger.trace("Receiver thread waiting up to " + waitTime + "ms for something interesting (next ack: " +
-												(nextMessageAckTime - now) + "ms; next modack: " + (nextExtendTime - now) + ")");
-										pendingMessages.wait(waitTime);
-										continue;
-									} else if (nextMessageAckTime <= now) {
-										logger.trace("Receiver thread popping 1 message to ack");
-										messageToAck = pendingMessages.removeFirst().receivedMessage;
-									} else if (nextExtendTime <= now) {
-										for (ListIterator<MessageAndTime> it = pendingMessages.listIterator(); it.hasNext();) {
-											MessageAndTime messageAndTime = it.next();
-											if (messageAndTime.deadlineExtendTime <= now) {
-												it.remove();
-												it.add(new MessageAndTime(
-														messageAndTime.receivedMessage,
-														messageAndTime.minAckTime,
-														newDeadlineExtendTime));
-												messagesToExtend.add(messageAndTime.receivedMessage);
-											}
-										}
-										logger.trace("Receiver thread extending " + messagesToExtend.size() + " deadlines to " + deadlineDurationSeconds + "s from now");
-									} else {
-										throw new IllegalStateException("nextActTime or nextExtendTime should have happened if waitTime == 0");
-									}
-								}
-							}
-							boolean didSomething = false;
-							if (messageToAck != null) {
-								// based on com.google.cloud.pubsub.v1.StreamingSubscriberConnection.sendAckOperations
-								String ackId = messageToAck.getAckId();
-								String messageId = messageToAck.getMessage().getMessageId();
-								StreamObserver<Empty> loggingObserver = new StreamObserver<Empty>() {
-									@Override public void onNext(Empty value) { logger.trace("ack next"); }
-									@Override public void onError(Throwable t) {
-										logger.error("ack " + messageId + " failed", t);
-									}
-									@Override public void onCompleted() { logger.trace("ack completed"); }
-								};
-								logger.debug("Sending 1 ack: " + messageId);
-								timeoutStub.acknowledge(
-										AcknowledgeRequest.newBuilder()
-												.setSubscription(subscriptionName.toString())
-												.addAllAckIds(Collections.singletonList(ackId))
-												.build(),
-										loggingObserver);
-								nextAckTime = now + minTimeBetweenMessagesMs;
-
-								PubsubMessage message = messageToAck.getMessage();
-								Instant nowInstant = Instant.ofEpochMilli(now);
-								Timestamp publishTime = message.getPublishTime();
-								Instant publishTimeInstant = Instant.ofEpochSecond(publishTime.getSeconds(), publishTime.getNanos());
-								PubsubMessageMetadata jsonMsg = new PubsubMessageMetadata(
-										message.getMessageId(),
-										publishTimeInstant.toString(),
-										nowInstant.toString()
-								);
-								mapper.writeValue(generator, jsonMsg);
-								generator.flush();
-								didSomething = true;
-							}
-							if (!messagesToExtend.isEmpty()) {
-								// based on com.google.cloud.pubsub.v1.StreamingSubscriberConnection.sendAckOperations
-								ArrayList<String> ackIds = new ArrayList<>();
-								ArrayList<String> messageIds = new ArrayList<>();
-								StreamObserver<Empty> loggingObserver = new StreamObserver<Empty>() {
-									@Override public void onNext(Empty value) { logger.trace("extend next"); }
-									@Override public void onError(Throwable t) {
-										logger.error("extend " + messageIds + " failed", t);
-									}
-									@Override public void onCompleted() { logger.trace("extend completed"); }
-								};
-
-								for (ReceivedMessage receivedMessage: messagesToExtend) {
-									ackIds.add(receivedMessage.getAckId());
-									messageIds.add(receivedMessage.getMessage().getMessageId());
-								}
-								logger.debug("Sending " + messageIds.size() + " modacks to " + deadlineDurationSeconds + ": " + messageIds);
-								timeoutStub.modifyAckDeadline(
-										ModifyAckDeadlineRequest.newBuilder()
-												.setSubscription(subscriptionName.toString())
-												.addAllAckIds(ackIds)
-												.setAckDeadlineSeconds(deadlineDurationSeconds)
-												.build(),
-										loggingObserver);
-								didSomething = true;
-							}
-							if (!didSomething) {
-								throw new IllegalStateException("Critical loop should have given us work to do");
-							}
-						}
-					} catch (Exception e) {
-						complete.setException(e);
 					}
-				}
-			}, "MyMessageReceiver");
-			receiverThread.setDaemon(true);
-			receiverThread.start();
 
-			complete.get();
-		} catch (InterruptedException e) {
-			logger.error("Interrupted", e);
-		} catch (ExecutionException e) {
-			logger.error("StreamObserver onError", e);
-		} finally {
-			if (channelProvider.shouldAutoClose()) {
+					@Override
+					public void onCompleted() {
+						connectionComplete.set(null);
+					}
+				};
+			}
+			private StreamObserver<Empty> loggingStreamObserver(String name, List<String> messageIds) {
+				return new StreamObserver<Empty>() {
+					@Override
+					public void onNext(Empty value) {
+						logger.trace(name + " next");
+					}
+
+					@Override
+					public void onError(Throwable t) {
+						logger.error(name + " " + messageIds + " failed", t);
+					}
+
+					@Override
+					public void onCompleted() {
+						logger.trace(name + " completed");
+					}
+				};
+			}
+			private void receiveMessage(PubsubMessage message, JsonGenerator generator, long now, int connectionNum) throws IOException {
+				Instant nowInstant = Instant.ofEpochMilli(now);
+				Timestamp publishTime = message.getPublishTime();
+				Instant publishTimeInstant = Instant.ofEpochSecond(publishTime.getSeconds(), publishTime.getNanos());
+				PubsubMessageMetadata jsonMsg = new PubsubMessageMetadata(
+						message.getMessageId(),
+						publishTimeInstant.toString(),
+						nowInstant.toString(),
+						connectionNum
+				);
+				mapper.writeValue(generator, jsonMsg);
+				generator.flush();
+			}
+			@Override
+			public void run() {
 				try {
-					transportChannel.close();
-				} catch (Exception e) {
-					logger.error("Could not close stream", e);
+					logger.debug("Receiver thread starting");
+					OutputStream outputStream;
+					if (logTo != null) {
+						outputStream = new FileOutputStream(logTo);
+					} else {
+						outputStream = ByteStreams.nullOutputStream();
+					}
+					JsonGenerator generator;
+					try {
+						generator = mapper.getFactory()
+								.setRootValueSeparator("\n")
+								.createGenerator(outputStream);
+					} catch (IOException e) {
+						throw new RuntimeException(e);  // should not happen
+					}
+
+					for (int connectionNum = 0; !receiverGaveUp.isDone(); connectionNum++) {  // each reconnect
+						SettableFuture<Void> connectionComplete = SettableFuture.create();
+						// Synchronized on itself
+						LinkedList<MessageAndTime> pendingMessages = new LinkedList<>();
+						// Access to this AtomicBoolean is synchronized on pendingMessages so it doesn't need to be atomic
+						AtomicBoolean outstandingRequestCalled = new AtomicBoolean();
+
+						// Based on Subscriber.java:
+						GrpcTransportChannel transportChannel;
+						Channel channel;
+						try {
+							// Create only a single Channel
+							transportChannel = (GrpcTransportChannel) channelProvider.getTransportChannel();
+							channel = transportChannel.getChannel();
+						} catch (IOException e) {
+							logger.error("Failure creating channel", e);
+							return;
+						}
+						ClientCallStreamObserver<StreamingPullRequest> requestObserver = null;
+						try {
+							// google-cloud-pubsub/src/main/java/com/google/cloud/pubsub/v1/StreamingSubscriberConnection.java
+							SubscriberGrpc.SubscriberStub stubTmp = SubscriberGrpc.newStub(channel);
+							if (callCredentials != null) stubTmp = stubTmp.withCallCredentials(callCredentials);
+							final SubscriberGrpc.SubscriberStub stub = stubTmp;
+
+
+							ClientResponseObserver<StreamingPullRequest, StreamingPullResponse> responseObserver = createResponseObserver(
+									pendingMessages, outstandingRequestCalled, connectionComplete);
+							requestObserver =
+									(ClientCallStreamObserver<StreamingPullRequest>)
+											stub.streamingPull(responseObserver);
+							// We need to set streaming ack deadline, but it's not useful since we'll modack to send receipt anyway.
+							// Set to some big-ish value in case we modack late.
+							requestObserver.onNext(
+									StreamingPullRequest.newBuilder()
+											.setSubscription(subscriptionName.toString())
+											.setStreamAckDeadlineSeconds(60)
+											.build());
+							requestObserver.request(1);
+							outstandingRequestCalled.set(true);
+							long nextAckTime = 0;  // Minimum ack time based on simulated processing time
+							while (true) {
+								long now = System.currentTimeMillis();
+								long newDeadline = now + DEADLINE_EXTEND_AMOUNT;
+								long newDeadlineExtendTime = newDeadline - DEADLINE_EXTEND_PADDING;
+								int deadlineDurationSeconds = (int) ((newDeadline - now) / 1000);
+								ReceivedMessage messageToAck = null;
+								ArrayList<ReceivedMessage> messagesToExtend = new ArrayList<>();
+
+								synchronized (pendingMessages) {
+									// Prevent delays by making sure we always have a queue of messages to process
+									if (pendingMessages.size() < (sleepBetweenPublish == 0 ? 100 : 5 + perMessageSleepMs / sleepBetweenPublish)
+											&& outstandingRequestCalled.getAndSet(true)) {
+										int count = 1;
+										logger.trace("Receiver requesting " + count + " message");
+										requestObserver.request(count);
+									}
+									if (connectionComplete.isDone()) {
+										connectionComplete.get();  // throw the exception
+									} else if (pendingMessages.isEmpty()) {
+										logger.trace("Receiver thread queue empty; waiting");
+										pendingMessages.wait();
+										continue;
+									} else {
+										long nextExtendTime = Long.MAX_VALUE;
+										for (MessageAndTime messageAndTime : pendingMessages) {
+											nextExtendTime = Math.min(nextExtendTime, messageAndTime.deadlineExtendTime);
+										}
+										MessageAndTime nextMessage = pendingMessages.getFirst();
+										long nextMessageAckTime = Math.max(
+												nextAckTime,
+												nextMessage.minAckTime);
+										long waitTime = Math.min(nextMessageAckTime, nextExtendTime) - now;
+										if (waitTime > 0) {
+											logger.trace("Receiver thread waiting up to " + waitTime + "ms for something interesting (next ack: " +
+													(nextMessageAckTime - now) + "ms; next modack: " + (nextExtendTime - now) + ")");
+											pendingMessages.wait(waitTime);
+											continue;
+										} else if (nextMessageAckTime <= now) {
+											logger.trace("Receiver thread popping 1 message to ack");
+											messageToAck = pendingMessages.removeFirst().receivedMessage;
+										} else if (nextExtendTime <= now) {
+											for (ListIterator<MessageAndTime> it = pendingMessages.listIterator(); it.hasNext(); ) {
+												MessageAndTime messageAndTime = it.next();
+												if (messageAndTime.deadlineExtendTime <= now) {
+													it.remove();
+													it.add(new MessageAndTime(
+															messageAndTime.receivedMessage,
+															messageAndTime.minAckTime,
+															newDeadlineExtendTime));
+													messagesToExtend.add(messageAndTime.receivedMessage);
+												}
+											}
+											logger.trace("Receiver thread extending " + messagesToExtend.size() + " deadlines to " + deadlineDurationSeconds + "s from now");
+										} else {
+											throw new IllegalStateException("nextActTime or nextExtendTime should have happened if waitTime == 0");
+										}
+									}
+								}
+								boolean didSomething = false;
+								if (messageToAck != null) {
+									// based on com.google.cloud.pubsub.v1.StreamingSubscriberConnection.sendAckOperations
+									String ackId = messageToAck.getAckId();
+									String messageId = messageToAck.getMessage().getMessageId();
+									StreamObserver<Empty> loggingObserver = loggingStreamObserver(
+											"ack", Collections.singletonList(messageId));
+									logger.debug("Sending 1 ack: " + messageId);
+									SubscriberGrpc.SubscriberStub timeoutStub =
+											stub.withDeadlineAfter(60, TimeUnit.SECONDS);
+									timeoutStub.acknowledge(
+											AcknowledgeRequest.newBuilder()
+													.setSubscription(subscriptionName.toString())
+													.addAllAckIds(Collections.singletonList(ackId))
+													.build(),
+											loggingObserver);
+									nextAckTime = now + minTimeBetweenMessagesMs;
+
+									PubsubMessage message = messageToAck.getMessage();
+									receiveMessage(message, generator, now, connectionNum);
+									didSomething = true;
+								}
+								if (!messagesToExtend.isEmpty()) {
+									// based on com.google.cloud.pubsub.v1.StreamingSubscriberConnection.sendAckOperations
+									ArrayList<String> ackIds = new ArrayList<>();
+									ArrayList<String> messageIds = new ArrayList<>();
+									StreamObserver<Empty> loggingObserver = loggingStreamObserver(
+											"extend ", messageIds);
+
+									for (ReceivedMessage receivedMessage : messagesToExtend) {
+										ackIds.add(receivedMessage.getAckId());
+										messageIds.add(receivedMessage.getMessage().getMessageId());
+									}
+									logger.debug("Sending " + messageIds.size() + " modacks to " + deadlineDurationSeconds + ": " + messageIds);
+									SubscriberGrpc.SubscriberStub timeoutStub =
+											stub.withDeadlineAfter(60, TimeUnit.SECONDS);
+									timeoutStub.modifyAckDeadline(
+											ModifyAckDeadlineRequest.newBuilder()
+													.setSubscription(subscriptionName.toString())
+													.addAllAckIds(ackIds)
+													.setAckDeadlineSeconds(deadlineDurationSeconds)
+													.build(),
+											loggingObserver);
+									didSomething = true;
+								}
+								if (!didSomething) {
+									throw new IllegalStateException("Critical loop should have given us work to do");
+								}
+							}
+						} catch (StatusRuntimeException e) {
+							logger.warn("Reconnecting after StatusRuntimeException", e);
+							continue;
+						} catch (ExecutionException e) {
+							if (e.getCause() instanceof StatusRuntimeException) {
+								StatusRuntimeException se = (StatusRuntimeException) e.getCause();
+								logger.warn("Reconnecting after StreamingPull StatusRuntimeException", se);
+								continue;
+							} else {
+								receiverGaveUp.setException(e);
+								break;
+							}
+						} catch (Throwable e) {
+							receiverGaveUp.setException(e);
+							break;
+						} finally {
+							if (requestObserver != null) {
+								try {
+									requestObserver.cancel("Closing channels prior to reconnect", null);
+								} catch (Exception e) {
+									logger.error("RequestObserver.cancel threw exception while shutting down; ignoring", e);
+								}
+							}
+							if (channelProvider.shouldAutoClose()) {
+								try {
+									transportChannel.close();
+								} catch (Exception e) {
+									logger.error("Could not close stream", e);
+								}
+							}
+						}
+					}
+				} catch (Throwable e) {
+					receiverGaveUp.setException(e);
 				}
 			}
+		}, "MyMessageReceiver");
+		receiverThread.setDaemon(true);
+		receiverThread.start();
+
+		try {
+			receiverGaveUp.get();
+			logger.info("Main thread exiting after receiver completed (should not happen)");
+		} catch (InterruptedException e) {
+			logger.error("Main thread exiting after interruption");
+		} catch (ExecutionException e) {
+			logger.error("Main thread exiting after receiver gave up", e);
 		}
 	}
 }
